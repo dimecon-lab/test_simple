@@ -70,7 +70,8 @@ int main()
 
         /* Print the data contained in the message. */
         printf("Your lucky number was %d!\n", message.lucky_number);
-        printf("Dodatak za drugi commit");
+        printf("Dodatak za drugi commit\r\n");
+        printf("Dodatak za treci commit");
     }
 
     return 0;
