@@ -1,0 +1,178 @@
+/*
+ ============================================================================
+ Name        : test.c
+ Author      : Sale
+ Version     :
+ Copyright   : Your copyright notice
+ Description : Hello World in C, Ansi-style
+ ============================================================================
+ */
+#include <stdio.h>
+#include "pb_encode.h"
+#include "pb_decode.h"
+#include "simple.pb.h"
+#include "my_global.h"
+#include "mysql.h"
+
+void finish_with_error(MYSQL *con)
+{
+  fprintf(stderr, "%s\n", mysql_error(con));
+  mysql_close(con);
+  exit(1);
+}
+
+int main()
+{
+	/* This is the buffer where we will store our message. */
+	uint8_t buffer[128];
+	size_t message_length;
+	bool status;
+
+	MYSQL *conn;
+	MYSQL_RES *res;
+	MYSQL_ROW row;
+	char   *hostinfo;
+	char   *serverinfo;
+	int    protoinfo;
+
+	char *server = "localhost";
+	char *user = "root";
+	char *password = "soa"; /* set me first */
+	char *database = "wordpress";
+	char *db_table = "test_table";
+	char query_str[500];
+
+	/* Encode our message */
+	{
+		/* Allocate space on the stack to store the message data.
+		 *
+		 * Nanopb generates simple struct definitions for all the messages.
+		 * - check out the contents of simple.pb.h! */
+		SimpleMessage message;
+
+		/* Create a stream that will write to our buffer. */
+		pb_ostream_t stream = pb_ostream_from_buffer(buffer, sizeof(buffer));
+
+		/* Fill in the lucky number */
+		message.lucky_number = 13;
+
+		/* Now we are ready to encode the message! */
+		status = pb_encode(&stream, SimpleMessage_fields, &message);
+		message_length = stream.bytes_written;
+
+		/* Then just check for any errors.. */
+		if (!status)
+		{
+			printf("Encoding failed: %s\n", PB_GET_ERROR(&stream));
+			return 1;
+		}
+	}
+
+	/* Now we could transmit the message over network, store it in a file or
+	 * wrap it to a pigeon's leg.
+	 */
+
+	/* But because we are lazy, we will just decode it immediately. */
+
+	{
+		/* Allocate space for the decoded message. */
+		SimpleMessage message;
+
+		/* Create a stream that reads from the buffer. */
+		pb_istream_t stream = pb_istream_from_buffer(buffer, message_length);
+
+		/* Now we are ready to decode the message. */
+		status = pb_decode(&stream, SimpleMessage_fields, &message);
+
+		/* Check for errors... */
+		if (!status)
+		{
+			printf("Decoding failed: %s\n", PB_GET_ERROR(&stream));
+			return 1;
+		}
+
+		/* Print the data contained in the message. */
+		printf("Your lucky number was %d!\n", message.lucky_number);
+
+		conn = mysql_init(NULL);
+
+		/* Connect to database */
+		if (!mysql_real_connect(conn, server,
+				user, password, database, 0, NULL, 0)) {
+			fprintf(stderr, "%s\n", mysql_error(conn));
+			exit(1);
+		}
+
+		/* Get host info */
+		hostinfo = mysql_get_host_info(conn);
+
+		/* Get server info */
+		serverinfo = mysql_get_server_info(conn);
+
+		/* Get protocol info */
+		protoinfo = mysql_get_proto_info(conn);
+
+		/* Output get info */
+		printf("MySQL Host: %s\n", hostinfo);
+		printf("MySQL Server: %s\n", serverinfo);
+		printf("MySQL Protocol: %d\n", protoinfo);
+		printf("MySQL Client: %s\n", mysql_get_client_info());
+
+
+		/* send SQL query */
+		if (mysql_query(conn, "show tables")) {
+			fprintf(stderr, "%s\n", mysql_error(conn));
+			exit(1);
+		}
+
+		res = mysql_use_result(conn);
+
+		/* output table name */
+		printf("MySQL Tables in %s database:\n", database);
+		while ((row = mysql_fetch_row(res)) != NULL)
+			printf("%s \n", row[0]);
+
+		{
+			sprintf(query_str, "INSERT INTO `%s` (`ts`, `value`) VALUES (CURRENT_TIMESTAMP, '11.5');", db_table);
+			if (mysql_query(conn, query_str))
+			{
+				finish_with_error(conn);
+			}
+
+			printf("MySQL measurement inserted into %s.\n", db_table);
+
+			printf("MySQL test_table records:\n");
+			sprintf(query_str, "SELECT * FROM test_table;", db_table);
+			if (mysql_query(conn, query_str))
+			{
+				finish_with_error(conn);
+			}
+
+			res = mysql_store_result(conn);
+
+			if (res == NULL)
+			{
+				finish_with_error(conn);
+			}
+
+			int num_fields = mysql_num_fields(res);
+
+			while ((row = mysql_fetch_row(res)))
+			{
+				for(int i = 0; i < num_fields; i++)
+				{
+					printf("%s ", row[i] ? row[i] : "NULL");
+				}
+				printf("\n");
+			}
+
+			/* close connection */
+			mysql_free_result(res);
+			mysql_close(conn);
+		}
+
+	}
+
+	return 0;
+}
+

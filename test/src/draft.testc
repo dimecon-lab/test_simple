@@ -1,0 +1,613 @@
+/**
+    Simple TCP client to fetch a web page
+    Silver Moon (m00n.silv3r@gmail.com)
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>    //strlen
+#include <unistd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h> //inet_addr
+#include <sys/fcntl.h>
+#include <errno.h>
+#include <malloc.h>
+#include <pthread.h>
+#include <sys/time.h>
+
+#define INT8U  uint8_t
+#define INT16U uint16_t
+#define INT32U unsigned long int
+#define INT64U uint64_t
+
+#define INT8S  int8_t
+#define INT16S int16_t
+#define INT32S long int
+
+#define SERIAL_NUMBER_SIZE		(8u)
+#define MAX_XELEMENT_LENGTH 		10*1024
+#define UDP_DLMS_PACKET_MAX_DATA_LENGTH	1000	// Maksimalna velicina korisnog sadrzaja DLMS HDLC poruke
+#define UNIT_UDP_REC_BUFFER_LENGTH 2*1024
+#define UNIT_DLMS_PORT_UDP   		  	(4059)	// Port za udp dlms komunikaciju
+#define MAX_SLOTS	10
+
+#define UDP_DLMS_RECEIVE_TIMEOUT_SECS  10
+
+#define PIPE_MESSAGE_CODE_RECEIVE  1
+#define PIPE_MESSAGE_CODE_ACK      2
+#define PIPE_MESSAGE_CODE_NACK     3
+
+#define DLMS_SLOT_STATE_FREE		     0
+#define DLMS_SLOT_STATE_STOPPED		     1
+#define DLMS_SLOT_STATE_WAIT_SRNM_RESP	 2
+#define DLMS_SLOT_STATE_WAIT_INFO_RESP	 3
+
+struct thread_args { int fd[2]; };
+
+typedef struct _cosem_aa_struct_ {
+	INT32U fc;
+	INT8U client_sys_t[8];
+	INT8U conformance_block[2];
+	INT16U max_apdu_size;
+	INT8U StoC[8];
+	INT8U CtoS[8];
+} cosem_aa_struct;
+
+typedef struct _cosem_server_struct_ {
+	INT8U glo_ek[16];
+	INT8U glo_ak[16];
+	INT8U my_sys_t[8];
+    cosem_aa_struct aa;
+	INT8U  request_apdu[MAX_XELEMENT_LENGTH] __attribute__ ((aligned(4)));;
+	INT8U  response_apdu[MAX_XELEMENT_LENGTH] __attribute__ ((aligned(4)));;
+} cosem_server_struct;
+
+typedef struct _dl_dlms_message_ {
+	INT16U	sender;
+	INT16U	send_code;
+	INT16U	receiver;
+ 	INT8U	msn[2*SERIAL_NUMBER_SIZE+1];	/* Serijski broj brojila */
+	INT8U 	Comm_interface; 				/* 485 / 232 / UART1 / UART2 */
+ 	INT16U 	size;							/* Velicina poruke u bajtovima */
+	INT8U 	message[MAX_XELEMENT_LENGTH] __attribute__ ((aligned(4)));;
+} dl_dlms_message;
+
+typedef struct _al_dlms_message_ {
+	INT16U sender;
+	INT16U send_code;
+	INT8U  msn[2*SERIAL_NUMBER_SIZE+1];	// Serijski broj brojila (string)
+	INT8U  lmc_ip[16];					// IP LMCa (string)
+ 	INT16U size;						// Velicina poruke u bajtovima
+	INT8U  message[MAX_XELEMENT_LENGTH] __attribute__ ((aligned(4)));;
+} al_dlms_message;
+
+typedef struct _udp_dlms_struct_ {
+	INT16U State; /* Trenutno stanje izvrsavanja */
+ 	INT8U  msn[2*SERIAL_NUMBER_SIZE+1];	 // Serijski broj brojila (string)
+	INT8U  lmc_ip[16];					 // IP LMCa (string)
+	struct sockaddr_in destination_addr; // IP LMCa (socket struktura)
+	INT32U destination;					 // Serijski broj brojila (int)
+	INT32U source;
+	dl_dlms_message client_msg;
+	dl_dlms_message server_msg;
+	INT8U  client_msg_check_byte;
+	INT8U  server_msg_check_byte;
+	INT8U  server_msg_no, client_msg_no;
+	INT8U  server_msg_no_start, server_msg_no_end;
+	time_t receive_timeout;
+	INT8U  chunk[UNIT_UDP_REC_BUFFER_LENGTH];
+	INT16U offset_for_chunk;
+	INT8U  Phase, ErrorNb, Retry_count, Disconnect;
+} udp_dlms_struct;
+
+typedef struct _client_data_struct_ {
+    al_dlms_message pipe_msg;
+	struct sockaddr_in my_listen_addr;
+	udp_dlms_struct slot[MAX_SLOTS];
+	int print_signaling, print_messages;
+} client_data_struct;
+
+client_data_struct *client_data;
+
+static const INT16U dlms_comm_fcstab[256] = {
+  0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf,
+  0x8c48, 0x9dc1, 0xaf5a, 0xbed3, 0xca6c, 0xdbe5, 0xe97e, 0xf8f7,
+  0x1081, 0x0108, 0x3393, 0x221a, 0x56a5, 0x472c, 0x75b7, 0x643e,
+  0x9cc9, 0x8d40, 0xbfdb, 0xae52, 0xdaed, 0xcb64, 0xf9ff, 0xe876,
+  0x2102, 0x308b, 0x0210, 0x1399, 0x6726, 0x76af, 0x4434, 0x55bd,
+  0xad4a, 0xbcc3, 0x8e58, 0x9fd1, 0xeb6e, 0xfae7, 0xc87c, 0xd9f5,
+  0x3183, 0x200a, 0x1291, 0x0318, 0x77a7, 0x662e, 0x54b5, 0x453c,
+  0xbdcb, 0xac42, 0x9ed9, 0x8f50, 0xfbef, 0xea66, 0xd8fd, 0xc974,
+  0x4204, 0x538d, 0x6116, 0x709f, 0x0420, 0x15a9, 0x2732, 0x36bb,
+  0xce4c, 0xdfc5, 0xed5e, 0xfcd7, 0x8868, 0x99e1, 0xab7a, 0xbaf3,
+  0x5285, 0x430c, 0x7197, 0x601e, 0x14a1, 0x0528, 0x37b3, 0x263a,
+  0xdecd, 0xcf44, 0xfddf, 0xec56, 0x98e9, 0x8960, 0xbbfb, 0xaa72,
+  0x6306, 0x728f, 0x4014, 0x519d, 0x2522, 0x34ab, 0x0630, 0x17b9,
+  0xef4e, 0xfec7, 0xcc5c, 0xddd5, 0xa96a, 0xb8e3, 0x8a78, 0x9bf1,
+  0x7387, 0x620e, 0x5095, 0x411c, 0x35a3, 0x242a, 0x16b1, 0x0738,
+  0xffcf, 0xee46, 0xdcdd, 0xcd54, 0xb9eb, 0xa862, 0x9af9, 0x8b70,
+  0x8408, 0x9581, 0xa71a, 0xb693, 0xc22c, 0xd3a5, 0xe13e, 0xf0b7,
+  0x0840, 0x19c9, 0x2b52, 0x3adb, 0x4e64, 0x5fed, 0x6d76, 0x7cff,
+  0x9489, 0x8500, 0xb79b, 0xa612, 0xd2ad, 0xc324, 0xf1bf, 0xe036,
+  0x18c1, 0x0948, 0x3bd3, 0x2a5a, 0x5ee5, 0x4f6c, 0x7df7, 0x6c7e,
+  0xa50a, 0xb483, 0x8618, 0x9791, 0xe32e, 0xf2a7, 0xc03c, 0xd1b5,
+  0x2942, 0x38cb, 0x0a50, 0x1bd9, 0x6f66, 0x7eef, 0x4c74, 0x5dfd,
+  0xb58b, 0xa402, 0x9699, 0x8710, 0xf3af, 0xe226, 0xd0bd, 0xc134,
+  0x39c3, 0x284a, 0x1ad1, 0x0b58, 0x7fe7, 0x6e6e, 0x5cf5, 0x4d7c,
+  0xc60c, 0xd785, 0xe51e, 0xf497, 0x8028, 0x91a1, 0xa33a, 0xb2b3,
+  0x4a44, 0x5bcd, 0x6956, 0x78df, 0x0c60, 0x1de9, 0x2f72, 0x3efb,
+  0xd68d, 0xc704, 0xf59f, 0xe416, 0x90a9, 0x8120, 0xb3bb, 0xa232,
+  0x5ac5, 0x4b4c, 0x79d7, 0x685e, 0x1ce1, 0x0d68, 0x3ff3, 0x2e7a,
+  0xe70e, 0xf687, 0xc41c, 0xd595, 0xa12a, 0xb0a3, 0x8238, 0x93b1,
+  0x6b46, 0x7acf, 0x4854, 0x59dd, 0x2d62, 0x3ceb, 0x0e70, 0x1ff9,
+  0xf78f, 0xe606, 0xd49d, 0xc514, 0xb1ab, 0xa022, 0x92b9, 0x8330,
+  0x7bc7, 0x6a4e, 0x58d5, 0x495c, 0x3de3, 0x2c6a, 0x1ef1, 0x0f78
+};
+
+/* Funkcija pretvara vrednost long unsigned int u hex kodirane bajtove */
+void luint2codedbytes(INT32U ui, unsigned char *s, int len_s) {
+  unsigned char cnt = 0;
+  for (cnt=1; cnt <= len_s; cnt++) {
+    s[len_s-cnt] = (unsigned char)(ui % 256);
+	ui = ui / 256;
+  }
+}
+
+/* Funkcija pretvara vrednost long unsigned int u string */
+void luint2str(INT32U ui, unsigned char *s) {
+  unsigned char i = 0, cypher;
+  INT32U num;
+  for(num=1000000000; num >= 1; num/=10) {
+    cypher = (unsigned char)(ui / num);
+    if ((i > 0) || (cypher > 0)) s[i++]=cypher+'0';
+    ui = ui % num;
+  }
+  s[i] = 0;
+}
+
+static INT8U parse_udp_dlms_chunk(INT8U *chunk_buff, INT16U chunk_buff_len, struct sockaddr *sender_addr, INT8U *slot) {
+	INT16U chunk_len;
+	INT32U source, destination;
+	INT8U  result, i;
+
+	result = ((chunk_buff[0] == 0x7E) && ((chunk_buff[1] & 0xA0) == 0xA0));
+
+	if (result) {
+		chunk_len = 256*(INT16U)(chunk_buff[1] & 0x07) + (INT16U)chunk_buff[2];
+		result = (chunk_len + 2 == chunk_buff_len);
+	}
+
+	if (result) {
+
+		destination = 0; source = 0; i = 2;
+		do
+			destination = destination*128 + (INT32U)(chunk_buff[++i] >> 1);
+		while ((chunk_buff[i] & 0x01) == 0);
+		do
+			source = source*128 + (INT32U)(chunk_buff[++i] >> 1);
+		while ((chunk_buff[i] & 0x01) == 0);
+
+		// Find source
+		for (result=0; result < MAX_SLOTS; result++) {
+			if (client_data->slot[result].destination == source)
+				break;
+		}
+		if (result < MAX_SLOTS) {
+			*slot = result;
+			result = 1;
+
+			client_data->slot[*slot].server_msg_check_byte = chunk_buff[++i];
+
+			i += 3; // Skip HCS
+
+			if ((client_data->slot[*slot].server_msg_check_byte & 0x1) == 0)	{ // Information Frame Received
+				if (((client_data->slot[*slot].server_msg_check_byte >> 1) & 0x7) == client_data->slot[*slot].server_msg_no) { // Ok broj prijemne serverove poruke
+					client_data->slot[*slot].server_msg_no = (client_data->slot[*slot].server_msg_no+1) & 0x7; // Sledeca prijemna serverove poruka koja se ocekuje
+
+					if (chunk_buff[i] == 0x7E) {
+						// Nema DATA sekcije
+					} else {
+						// Ekstrakcija korisne DLMS poruke iz HDLC tela
+						memmove(client_data->slot[*slot].server_msg.message + client_data->slot[*slot].server_msg.size, chunk_buff+i, chunk_len-i-1);
+						client_data->slot[*slot].server_msg.size += (chunk_len-i-1);
+					}
+					if (chunk_buff[1] & 0x08)
+						result = 2;
+				} else {
+					result = 2; // Nije ok broj prijemne poruke, kazi serveru da ocekujes client_data->slot[*slot].server_msg_no (nije uvecana kao gore)
+				}
+			}
+		} else {
+			result = 0;
+		}
+	}
+	return result;
+}
+
+void dlms_comm_calc_hdlc_fcs(INT8U *Packet, INT16U start, INT16U length, INT8U *loByte, INT8U *hiByte) {
+	INT16U fcs = 0xffff;
+ 	INT16U i;
+	for (i = start; i < start+length; i++) {
+		fcs = (INT16U)((fcs >> 8) ^ dlms_comm_fcstab[(fcs ^ Packet[i]) & 0xff]);
+	}
+   	fcs ^= 0xffff;
+	*loByte = (INT8U)(fcs % 256);
+	*hiByte = (INT8U)(fcs / 256);
+}
+
+static INT16U make_udp_dlms_chunk(INT8U *Hdlc_data, INT16U Hdlc_data_len, INT16U Hdlc_data_offset,
+								  INT8U Check_byte, INT32U destination, INT32U source,
+								  INT8U *chunk_buff) {
+	INT8U fcsLo, fcsHi;
+	INT16U chunk_len;
+	INT32U temp32u;
+
+	if (Hdlc_data_len > 0) {
+		if (Hdlc_data_len - Hdlc_data_offset <= UDP_DLMS_PACKET_MAX_DATA_LENGTH) {
+			chunk_len = Hdlc_data_len - Hdlc_data_offset;
+		} else {
+			chunk_len = UDP_DLMS_PACKET_MAX_DATA_LENGTH;
+		}
+	} else {
+		chunk_len = 0;
+	}
+
+	chunk_buff[0] = 0x7E; // HDLC start byte
+
+	// HDLC header
+
+	if (chunk_len > 0) {
+		if (Hdlc_data_offset + chunk_len == Hdlc_data_len) {
+			chunk_buff[1] = 0xA0; // Format
+		} else {
+			chunk_buff[1] = 0xA8; // Fragment
+		}
+		chunk_buff[1] += (INT8U)((chunk_len+15) / 256);
+		chunk_buff[2] = (INT8U)((chunk_len+15) % 256); // Duzina korisne HDLC poruke = 13 (header) + len(poruka) + 2 FCS, 2 x 0x7E se ne racuna
+	} else {
+		chunk_buff[1] = 0xA0; // Format
+		chunk_buff[2] = 13;   // Duzina korisne HDLC poruke = 13 (header), 2 x 0x7E se ne racuna
+	}
+
+	temp32u = destination;
+	for(fcsLo=0; fcsLo<=3; fcsLo++) {
+	  chunk_buff[6-fcsLo] = ((INT8U)(temp32u % 128) << 1);
+	  temp32u = temp32u / 128;
+	}
+	chunk_buff[6] |= 0x01;
+
+	temp32u = source;
+	for(fcsLo=0; fcsLo<=3; fcsLo++) {
+	  chunk_buff[10-fcsLo] = ((INT8U)(temp32u % 128) << 1);
+	  temp32u = temp32u / 128;
+	}
+	chunk_buff[10] |= 0x01;
+
+	chunk_buff[11] = Check_byte;
+
+	dlms_comm_calc_hdlc_fcs(chunk_buff, 1, 11, &fcsLo, &fcsHi);
+	chunk_buff[12] = fcsLo; chunk_buff[13] = fcsHi;
+
+	// HDLC command, FCS i kraj HDLC poruke
+
+	if (chunk_len > 0) {
+		memmove(chunk_buff+14, Hdlc_data + Hdlc_data_offset, chunk_len);
+		dlms_comm_calc_hdlc_fcs(chunk_buff, 1, chunk_len + 13, &fcsLo, &fcsHi); // Duzina = chunk_len + 13 (header)
+		chunk_buff[14+chunk_len] = fcsLo; chunk_buff[15+chunk_len] = fcsHi;
+		chunk_buff[16+chunk_len] = 0x7E;
+		temp32u = chunk_len + 17; // 13 (header) + 2 (fcs) + 2 (0x7E)
+	} else {
+		chunk_buff[14] = 0x7E;
+		temp32u = 15; // 13 (header) + 2 (0x7E)
+	}
+	return (INT16U)temp32u;
+}
+
+int open_client_socket(int port) {
+	int sd, iSockFlags;
+    struct sockaddr_in addr;
+
+    sd = socket(PF_INET, SOCK_DGRAM, 0);
+    if (sd == -1) {
+         printf("Communicator Client: Could not create socket.");
+         return sd;
+     }
+
+    //The socket must be Non-Blocking to avoid accept to be blocking
+    iSockFlags = fcntl(sd, F_GETFL, 0);
+    iSockFlags |= O_NONBLOCK;
+    fcntl(sd, F_SETFL, iSockFlags);
+
+    bzero(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if ( bind(sd, (struct sockaddr*)&addr, sizeof(addr)) != 0 ) {
+        perror("Communicator Client: Can't bind port.");
+        close(sd);
+        sd = -1;
+    }
+    return sd;
+}
+
+void make_and_send_info_chunk(INT8U dst_slot, INT8U *message, int my_fd) {
+	INT16S result;
+	client_data->slot[dst_slot].client_msg_check_byte = (((client_data->slot[dst_slot].server_msg_no << 5) & 0xE0) | 16 | (client_data->slot[dst_slot].client_msg_no << 1));
+	result = make_udp_dlms_chunk(client_data->slot[dst_slot].client_msg.message, client_data->slot[dst_slot].client_msg.size, 0,
+							 	 client_data->slot[dst_slot].client_msg_check_byte, client_data->slot[dst_slot].destination, 0, message);
+	if (sendto(my_fd, message, result, 0, (struct sockaddr *)&client_data->slot[dst_slot].destination_addr, sizeof(struct sockaddr)) < 0) {
+    	printf("Communicator Client: INFO Request Send failed (IP %s, MSN %s).\n", client_data->slot[dst_slot].lmc_ip, client_data->slot[dst_slot].msn);
+	} else {
+		printf("Communicator Client: INFO Request Sent (IP %s, MSN %s, Snd %u, Rcv %u).\n", client_data->slot[dst_slot].lmc_ip, client_data->slot[dst_slot].msn, client_data->slot[dst_slot].client_msg_no, client_data->slot[dst_slot].server_msg_no);
+	}
+	client_data->slot[dst_slot].client_msg_no = (++client_data->slot[dst_slot].client_msg_no) % 0x7;
+}
+
+void* communicator_client(void *arg) {
+	int curr_slot = 0;
+	int receive_fd, send_fd, client_fd, max_sockets;
+	al_dlms_message pipe_msg;
+	fd_set fds, rfds;
+	struct timeval timeout = {1, 0};
+    struct thread_args *sent_fd = arg;
+    struct sockaddr_in server;
+    socklen_t addr_len = sizeof(struct sockaddr);
+    INT8U message[UNIT_UDP_REC_BUFFER_LENGTH], server_reply[6000];
+    INT16S result;
+
+    receive_fd = sent_fd->fd[0];
+    send_fd = sent_fd->fd[1];
+	client_fd = open_client_socket(UNIT_DLMS_PORT_UDP);
+
+	printf("Communicator Client: Started, Pipes (fd): rcv %d, send %d, socket %d\n", receive_fd, send_fd, client_fd);
+
+    FD_ZERO(&fds);
+    FD_SET(client_fd, &fds);  // Client UDP socket
+    FD_SET(receive_fd, &fds); // Pipe from Communicator Client
+    max_sockets = client_fd > receive_fd ? client_fd : receive_fd;
+
+    client_data = malloc(sizeof(client_data_struct));
+    memset(client_data, 0, sizeof(client_data_struct));
+
+    // if (connect(client_fd , (struct sockaddr *)&server , sizeof(server)) < 0) {
+
+    while (1) {
+
+		rfds = fds;
+    	curr_slot = select(max_sockets+1, &rfds, NULL, NULL, &timeout);
+    	if (curr_slot == -1)
+    	    printf("Communicator Client: ERROR Function select() returned -1, errno %d.\n", errno);
+
+       	if (FD_ISSET(receive_fd, &rfds)) {
+			// Data from Main is available now
+       		if (read(receive_fd, &pipe_msg, sizeof(al_dlms_message)) != sizeof(al_dlms_message)) {
+				printf("Communicator Client: Error in reading pipe, function read().\n");
+			} else {
+				for (curr_slot=0; curr_slot < MAX_SLOTS; curr_slot++) {
+					if (!strcmp(client_data->slot[curr_slot].msn, pipe_msg.msn)) {
+						break;
+					}
+				}
+				if (curr_slot < MAX_SLOTS) {
+				} else {
+					// Ako nema, trazi prazan slot da stavis
+					for (curr_slot=0; curr_slot < MAX_SLOTS; curr_slot++) {
+						if (client_data->slot[curr_slot].State == DLMS_SLOT_STATE_FREE) {
+							break;
+						}
+					}
+					if (curr_slot < MAX_SLOTS) {
+						// Inicijalizuj nadjen prazan slot
+						memset(&(client_data->slot[curr_slot]), 0, sizeof(udp_dlms_struct));
+						strcpy(client_data->slot[curr_slot].msn, pipe_msg.msn);
+						sscanf(client_data->slot[curr_slot].msn, "%lu", &client_data->slot[curr_slot].destination);
+					}
+				}
+				if (curr_slot < MAX_SLOTS) {
+					strcpy(client_data->slot[curr_slot].lmc_ip, pipe_msg.lmc_ip);
+					inet_aton(client_data->slot[curr_slot].lmc_ip, &client_data->slot[curr_slot].destination_addr.sin_addr);
+					client_data->slot[curr_slot].destination_addr.sin_port = htons(UNIT_DLMS_PORT_UDP);
+					client_data->slot[curr_slot].destination_addr.sin_family = AF_INET;
+
+					memmove(client_data->slot[curr_slot].client_msg.message, pipe_msg.message, pipe_msg.size);
+					client_data->slot[curr_slot].client_msg.size = pipe_msg.size;
+
+				    if (client_data->slot[curr_slot].State == DLMS_SLOT_STATE_FREE) {
+				    	client_data->slot[curr_slot].client_msg_check_byte = 0x93;
+				    	result = make_udp_dlms_chunk(NULL, 0, 0, 0x93, client_data->slot[curr_slot].destination, 0, message);
+					    result = sendto(client_fd, message, result, 0, (struct sockaddr *)&client_data->slot[curr_slot].destination_addr, addr_len);
+					    if (result < 0) {
+					        printf("Communicator Client: SRNM Send failed (IP %s, MSN %s).\n", client_data->slot[curr_slot].lmc_ip, client_data->slot[curr_slot].msn);
+					    } else {
+					    	printf("Communicator Client: SRNM Sent (IP %s, MSN %s).\n", client_data->slot[curr_slot].lmc_ip, client_data->slot[curr_slot].msn);
+					    }
+				    } else {
+					    make_and_send_info_chunk(curr_slot, &message, client_fd);
+				    }
+				    client_data->slot[curr_slot].receive_timeout = time(NULL) + UDP_DLMS_RECEIVE_TIMEOUT_SECS;
+                	client_data->slot[curr_slot].State = DLMS_SLOT_STATE_WAIT_INFO_RESP;
+				} else {
+					pipe_msg.send_code = PIPE_MESSAGE_CODE_NACK;
+					write(send_fd, &pipe_msg, sizeof(al_dlms_message));
+				}
+			}
+       	}
+
+       	if (FD_ISSET(client_fd, &rfds)) {
+        	result = recvfrom(client_fd, server_reply, 6000 , 0, (struct sockaddr *)&server, &addr_len);
+        	if (result > 0) {
+        		result = parse_udp_dlms_chunk(server_reply, result, (struct sockaddr *)&server, &curr_slot);
+                if (result == 1) {
+			        if ((client_data->slot[curr_slot].server_msg_check_byte & 0x1) == 0)	{ // Information Frame Received
+			        	printf("Communicator Client: Received INFO server response (IP %s, MSN %s, S/R %u %u).\n", client_data->slot[curr_slot].lmc_ip, client_data->slot[curr_slot].msn,
+			        			(unsigned int)((client_data->slot[curr_slot].server_msg_check_byte >> 1) & 0x7), (unsigned int)((client_data->slot[curr_slot].server_msg_check_byte >> 5)));
+			        } else if ((client_data->slot[curr_slot].server_msg_check_byte & 0x1F) == 0x11) {
+			        	printf("Communicator Client: Received RR server response (IP %s, MSN %s, R %u).\n", client_data->slot[curr_slot].lmc_ip, client_data->slot[curr_slot].msn,
+			        			(unsigned int)((client_data->slot[curr_slot].server_msg_check_byte >> 5)));
+			        } else {
+			        	printf("Communicator Client: Received OTHER VALID server response (IP %s, MSN %s, Check Byte %u).\n", client_data->slot[curr_slot].lmc_ip, client_data->slot[curr_slot].msn,
+			        			(unsigned int)client_data->slot[curr_slot].server_msg_check_byte);
+			        }
+                	if (client_data->slot[curr_slot].client_msg_check_byte == 0x93) {
+                		make_and_send_info_chunk(curr_slot, &message, client_fd);
+                		client_data->slot[curr_slot].receive_timeout = time(NULL) + UDP_DLMS_RECEIVE_TIMEOUT_SECS;
+                		client_data->slot[curr_slot].State = DLMS_SLOT_STATE_WAIT_INFO_RESP;
+                	} else if (client_data->slot[curr_slot].State == DLMS_SLOT_STATE_WAIT_INFO_RESP) {
+                		client_data->slot[curr_slot].receive_timeout = 0;
+                		client_data->slot[curr_slot].State = DLMS_SLOT_STATE_STOPPED;
+                		pipe_msg.send_code = PIPE_MESSAGE_CODE_ACK;
+    					memmove(pipe_msg.message, client_data->slot[curr_slot].server_msg.message, client_data->slot[curr_slot].server_msg.size);
+    					pipe_msg.size = client_data->slot[curr_slot].client_msg.size;
+    					write(send_fd, &pipe_msg, sizeof(al_dlms_message));
+                	}
+                } else if (result == 2) {
+                	// Treba primiti jos
+                	client_data->slot[curr_slot].client_msg_check_byte = (((client_data->slot[curr_slot].server_msg_no << 5) & 0xE0) | 0x11);
+			    	result = make_udp_dlms_chunk(NULL, 0, 0, client_data->slot[curr_slot].client_msg_check_byte, client_data->slot[curr_slot].destination, 0, message);
+				    result = sendto(client_fd, message, result, 0, (struct sockaddr *)&client_data->slot[curr_slot].destination_addr, addr_len);
+		        	printf("Communicator Client: Received INFO SEGMENT server response (IP %s, MSN %s, S/R %u %u, RR %u sent).\n", client_data->slot[curr_slot].lmc_ip, client_data->slot[curr_slot].msn,
+		        			(unsigned int)((client_data->slot[curr_slot].server_msg_check_byte >> 1) & 0x7), (unsigned int)((client_data->slot[curr_slot].server_msg_check_byte >> 5)), client_data->slot[curr_slot].server_msg_no);
+                } else {
+                	// Invalid response
+		        	printf("Communicator Client: Received INVALID server response (IP %s, MSN %s, Check Byte %u).\n", client_data->slot[curr_slot].lmc_ip, client_data->slot[curr_slot].msn,
+		        			(unsigned int)client_data->slot[curr_slot].server_msg_check_byte);
+                }
+        	} else {
+        		printf("Communicator Client: ERROR Function recvfrom() returned -1, errno %d.\n", errno);
+        	}
+       	}
+
+       	// Provera isteka receive_timeout-a po slotovima
+       	for (curr_slot=0; curr_slot < MAX_SLOTS; curr_slot++) {
+       		if ((client_data->slot[curr_slot].State != DLMS_SLOT_STATE_FREE) && (client_data->slot[curr_slot].receive_timeout > 0) && (time(NULL) > client_data->slot[curr_slot].receive_timeout)) {
+       			if (client_data->slot[curr_slot].client_msg_check_byte == 0x93) {
+			    	result = make_udp_dlms_chunk(NULL, 0, 0, 0x93, client_data->slot[curr_slot].destination, 0, message);
+				    result = sendto(client_fd, message, result, 0, (struct sockaddr *)&client_data->slot[curr_slot].destination_addr, addr_len);
+       				client_data->slot[curr_slot].receive_timeout = time(NULL) + UDP_DLMS_RECEIVE_TIMEOUT_SECS;
+		        	printf("Communicator Client: TIMEOUT SRNM (IP %s, MSN %s, SRNM sent again).\n", client_data->slot[curr_slot].lmc_ip, client_data->slot[curr_slot].msn);
+       			} else {
+       				// Ovo treba doraditi: sada za sve trazi RR-om podatke
+                	client_data->slot[curr_slot].client_msg_check_byte = (((client_data->slot[curr_slot].server_msg_no << 5) & 0xE0) | 0x11);
+			    	result = make_udp_dlms_chunk(NULL, 0, 0, client_data->slot[curr_slot].client_msg_check_byte, client_data->slot[curr_slot].destination, 0, message);
+				    result = sendto(client_fd, message, result, 0, (struct sockaddr *)&client_data->slot[curr_slot].destination_addr, addr_len);
+				    client_data->slot[curr_slot].receive_timeout = time(NULL) + UDP_DLMS_RECEIVE_TIMEOUT_SECS;
+		        	printf("Communicator Client: TIMEOUT Receiving (IP %s, MSN %s, RR %u sent).\n", client_data->slot[curr_slot].lmc_ip, client_data->slot[curr_slot].msn,
+		        		    client_data->slot[curr_slot].server_msg_no);
+       			}
+       		}
+       	}
+       	if (curr_slot < MAX_SLOTS) {
+
+       	}
+    }
+
+    printf("Scheduler done.\n");
+    pthread_exit(NULL);
+    return NULL;
+}
+
+int main(int argc , char *argv[]) {
+    int  max_sockets, curr_slot, curr_msg;
+    int *iPtr;
+    unsigned char keyb_input[20];
+    int send_pipe_fd[2], receive_pipe_fd[2];
+    int receive_server_fd, send_server_fd;
+    al_dlms_message pipe_msg;
+    fd_set fds, rfds;
+    struct timeval timeout = {1, 0};
+
+    pthread_t server_tid;
+
+	curr_slot = pipe(send_pipe_fd);
+    if (curr_slot == 0) {
+    	send_server_fd = send_pipe_fd[1];
+    	printf("Sending Pipe -> Communicator Client thread, created ok (fd %d).\n", send_server_fd);
+	} else {
+		printf("Sending Pipe -> Communicator Client thread, error creating: %s\n", strerror(curr_slot));
+	}
+
+    curr_slot = pipe(receive_pipe_fd);
+    if (curr_slot == 0) {
+    	receive_server_fd = receive_pipe_fd[0];
+    	printf("Receiving Pipe <- Communicator Client thread, created ok (fd %d).\n", receive_server_fd);
+	} else {
+		printf("Receiving Pipe <- Communicator Client thread, error creating: %s", strerror(curr_slot));
+	}
+
+    send_pipe_fd[1] = receive_pipe_fd[1];
+    curr_slot = pthread_create(&server_tid, NULL, &communicator_client, &send_pipe_fd);
+    if (curr_slot == 0) {
+        printf("Communicator Client thread, created ok.\n");
+    } else {
+    	printf("Communicator Client thread, error creating: %s", strerror(curr_slot));
+    }
+
+    FD_ZERO(&fds);
+    FD_SET(0, &fds); // Std input
+    FD_SET(receive_server_fd, &fds); // Pipe from Communicator Client
+    max_sockets = receive_server_fd;
+
+    //set_conio_terminal_mode();
+
+    while (1) {
+
+    	rfds = fds;
+    	curr_slot = select(max_sockets+1, &rfds, NULL, NULL, &timeout);
+    	if (curr_slot == -1)
+    	    printf("MAIN ERROR: Function select() returned -1, errno %d.\n", errno);
+
+    	if (FD_ISSET(fileno(stdin), &rfds)) {
+    		read(fileno(stdin), keyb_input, sizeof(keyb_input));
+			if (keyb_input[0] == 'r') {
+				strcpy(pipe_msg.lmc_ip, "192.168.2.178");
+			    strcpy(pipe_msg.msn,    "35063603");
+			    pipe_msg.size = sizeof(HDLC_COMMAND_GET_NEXT);
+			    memmove(pipe_msg.message, HDLC_COMMAND_GET_NEXT, pipe_msg.size);
+			    write(send_server_fd, &pipe_msg, sizeof(al_dlms_message));
+
+				printf("\nMAIN: Message put (IP %s, MSN %s).\n", pipe_msg.lmc_ip, pipe_msg.msn);
+			} else if (keyb_input[0] == 't') {
+				strcpy(pipe_msg.lmc_ip, "192.168.2.179");
+				strcpy(pipe_msg.msn,    "35063604");
+				pipe_msg.size = sizeof(HDLC_COMMAND_GET_NEXT);
+				memmove(pipe_msg.message, HDLC_COMMAND_GET_NEXT, pipe_msg.size);
+				write(send_server_fd, &pipe_msg, sizeof(al_dlms_message));
+
+				printf("\nMAIN: Message put (IP %s, MSN %s).\n", pipe_msg.lmc_ip, pipe_msg.msn);
+			} else if (keyb_input[0] == 's') {
+    			curr_msg=0;
+    			for (curr_slot=0; curr_slot < MAX_SLOTS; curr_slot++) {
+    			    if (client_data->slot[curr_slot].State != DLMS_SLOT_STATE_FREE) {
+    			    	curr_msg++;
+    			    	printf("Slot %d: MSN %s, State %d\n", curr_slot+1, client_data->slot[curr_slot].msn, client_data->slot[curr_slot].State);
+    			    }
+    			}
+    			printf("\nOccupied Slots, total: %d\n", curr_msg);
+    		} else if (keyb_input[0] == 'n') {
+    			client_data->print_signaling = !client_data->print_signaling;
+    			printf("Print Signaling set to %d\n", client_data->print_signaling);
+    		} else if (keyb_input[0] == 'm') {
+    			client_data->print_messages = !client_data->print_messages;
+    			printf("\nPrint Messages set to %d\n", client_data->print_messages);
+    		}
+    	}
+
+    	if (FD_ISSET(receive_server_fd, &rfds)) {
+    	    // Data from Communicator Client is available now
+    		if (read(receive_server_fd, &pipe_msg, sizeof(al_dlms_message)) != sizeof(al_dlms_message)) {
+        	    printf("MAIN: Error in reading pipe, function read().\n");
+    		} else {
+    			if (pipe_msg.send_code == PIPE_MESSAGE_CODE_RECEIVE) {
+    			} else if (pipe_msg.send_code == PIPE_MESSAGE_CODE_ACK) { // PIPE_MESSAGE_CODE_ACK/PIPE_MESSAGE_CODE_NACK
+    				printf("MAIN: DLMS Response Received (MSN %s, IP %s, Size %u).\n", pipe_msg.msn, pipe_msg.lmc_ip, pipe_msg.size);
+    			} else { // NACK
+    				printf("MAIN: DLMS NACK Response Received (MSN %s, IP %s, Size %u).\n", pipe_msg.msn, pipe_msg.lmc_ip, pipe_msg.size);
+    			}
+    		}
+    	}
+    }
+
+    pthread_join(server_tid, (void**)&iPtr);
+    return 0;
+}
