@@ -2,7 +2,7 @@
  ============================================================================
  Name        : test.c
  Author      : Sale
- Version     :
+ Version     : V0.1
  Copyright   : Your copyright notice
  Description : Hello World in C, Ansi-style
  ============================================================================
@@ -34,6 +34,7 @@
 
 #define  SERVER_UDP_PORT	5683
 #define  MAX_MESSAGE_LENGTH  500
+//#define  MAX_MESSAGE_LENGTH  5
 
 #define INT8U  uint8_t
 #define INT16U uint16_t
@@ -47,28 +48,30 @@
 struct thread_args { int fd[2]; };
 
 typedef struct _pipe_message_ {
-	INT16U sender;
-	INT16U send_code;
+	INT8U  msg_id[8];
+	struct timeval msg_send_timestamp;   //
 	INT8U  source_ip[16];
 	INT16U source_port;
-	INT8U  destination_ip[16];
- 	INT16U size;						// Velicina poruke u bajtovima
-	INT8U  message[MAX_MESSAGE_LENGTH] __attribute__ ((aligned(4)));;
+	INT16U msg_payload_size;		 	 // Velicina poruke u bajtovima
+	INT8U  msg_payload[MAX_MESSAGE_LENGTH];
 } pipe_message;
 
-typedef struct _udp_struct_ {
-	INT16U State; /* Trenutno stanje izvrsavanja */
-	INT8U  lmc_ip[16];					 // IP LMCa (string)
-	struct sockaddr_in destination_addr; // IP LMCa (socket struktura)
-	INT32U destination;					 // Serijski broj brojila (int)
-	INT32U source;
-	//dl_dlms_message client_msg;
-	//dl_dlms_message server_msg;
-	time_t receive_timeout;
-	INT8U  chunk[MAX_MESSAGE_LENGTH];
-	INT16U offset_for_chunk;
-	INT8U  Phase, ErrorNb, Retry_count, Disconnect;
-} udp_struct;
+typedef struct _udp_packet_struct_ {
+	INT8U  msg_type;                     // za sada: 0 request, 1 response
+	INT8U  msg_id[8];					 // unique request_id given by original sender
+	struct timeval msg_send_timestamp;   //
+	INT16U msg_payload_size;		     //
+	INT8U  msg_payload[MAX_MESSAGE_LENGTH];
+} udp_packet_struct;
+
+#define INT8U  uint8_t
+#define INT16U uint16_t
+#define INT32U unsigned long int
+#define INT64U uint64_t
+
+#define INT8S  int8_t
+#define INT16S int16_t
+#define INT32S long int
 
 void finish_with_error(MYSQL *con)
 {
@@ -77,10 +80,38 @@ void finish_with_error(MYSQL *con)
   exit(1);
 }
 
+INT32S elapsed_usec(struct timeval mark) {
+    struct timeval current_tv_mark;
+	long nsec;
+	INT32S res2;
+
+	gettimeofday(&current_tv_mark, NULL);
+
+	//printf("current_tv_mark.tv_sec = %lu, current_tv_mark.tv_usec = %lu, mark.tv_sec = %lu, mark.tv_usec = %lu\r\n",current_tv_mark.tv_sec, current_tv_mark.tv_usec, mark.tv_sec, mark.tv_usec);
+
+	if (current_tv_mark.tv_usec < mark.tv_usec) {
+		nsec = (mark.tv_usec - current_tv_mark.tv_usec) / 1000000L + 1;
+		mark.tv_usec -= 1000000L * nsec;
+		mark.tv_sec += nsec;
+	}
+	if (current_tv_mark.tv_usec - mark.tv_usec > 1000000L) {
+		nsec = (current_tv_mark.tv_usec - mark.tv_usec) / 1000000L;
+		mark.tv_usec += 1000000L * nsec;
+		mark.tv_sec -= nsec;
+	}
+	//printf("current_tv_mark.tv_sec = %lu, current_tv_mark.tv_usec = %lu, mark.tv_sec = %lu, mark.tv_usec = %lu\r\n",current_tv_mark.tv_sec, current_tv_mark.tv_usec, mark.tv_sec, mark.tv_usec);
+    res2 = (INT32S)(current_tv_mark.tv_sec-mark.tv_sec)*1000000 + (INT32S)(current_tv_mark.tv_usec-mark.tv_usec);
+	//if ((res1-res2>1) || (res2-res1>1)) {
+	//	printf("\n!!!!!!!!! ERROR IN elapsed_millis res1 %d res2 %d !!!!!!!!!!!\n\n", res1, res2);
+	//}
+	return res2;
+}
+
 void nanopb_test() {
 	/* This is the buffer where we will store our message. */
 	uint8_t buffer[128];
 	size_t message_length;
+
 	bool status;
 	SimpleMessage message;
 
@@ -181,7 +212,7 @@ void* communicator_server(void *arg) {
 
     FD_ZERO(&fds);
     FD_SET(client_fd, &fds);  // Client UDP socket
-    FD_SET(receive_fd, &fds); // Pipe from Communicator Server
+    FD_SET(receive_fd, &fds); // Pipe from Application
     max_sockets = client_fd > receive_fd ? client_fd : receive_fd;
 
     // if (connect(client_fd , (struct sockaddr *)&client , sizeof(client)) < 0) {
@@ -212,22 +243,20 @@ void* communicator_server(void *arg) {
                 	//inet_ntoa(client_ip, &client.sin_addr);
                 	//client.sin_port = htons(UNIT_DLMS_PORT_UDP);
                 	//					client_data->slot[curr_slot].destination_addr.sin_family = AF_INET;
-        			pipe_msg.send_code = 0;
         			if (result < MAX_MESSAGE_LENGTH) {
-        				pipe_msg.size = result;
-        				memmove(pipe_msg.message, client_request, result);
-                    	printf("Communicator Server: Received UDP packet (IP %s:%d, Size %d) sent to MAIN.\n", pipe_msg.source_ip, pipe_msg.source_port, pipe_msg.size);
+        				pipe_msg.msg_payload_size = result;
+        				memmove(pipe_msg.msg_payload, client_request, result);
+                    	printf("Communicator Server: Received UDP packet (IP %s:%d, Size %d) sent to MAIN.\n", pipe_msg.source_ip, pipe_msg.source_port, pipe_msg.msg_payload_size);
                     	write(send_fd, &pipe_msg, sizeof(pipe_message));
         			} else {
-        				printf("Communicator Server: Received UDP packet (IP %s:%d, Size %d), TOO BIG - DROPED PACKET.\n", pipe_msg.source_ip, pipe_msg.source_port, pipe_msg.size);
+        				printf("Communicator Server: Received UDP packet (IP %s:%d, Size %d), TOO BIG - DROPED PACKET.\n", pipe_msg.source_ip, pipe_msg.source_port, pipe_msg.msg_payload_size);
         			}
         	} else if (result == 0) {
-				printf("Communicator Server: Received UDP packet (IP %s:%d, Size %d), ZERO CONTENT - DROPED PACKET.\n", pipe_msg.source_ip, pipe_msg.source_port, pipe_msg.size);
+				printf("Communicator Server: Received UDP packet (IP %s:%d, Size %d), ZERO CONTENT - DROPED PACKET.\n", pipe_msg.source_ip, pipe_msg.source_port, pipe_msg.msg_payload_size);
         	} else {
         		printf("Communicator Server: ERROR Function recvfrom() returned result %d, errno %d, %s.\n", result, errno, strerror(errno));
         	}
        	}
-
     }
 
     printf("Communicator Server: Done.\n");
@@ -260,10 +289,12 @@ int main() {
 	pipe_message pipe_msg;
 	fd_set fds, rfds;
 	struct timeval timeout = {1, 0};
+	struct timeval meas_tv;
+	INT32S elapsed_time;
     time_t curr_time;
     struct tm ltime;
     int prev_recv_sec = -1;
-    float test_value, fvalue0, fvalue1, fvalue2, fvalue3;
+    float test_value, fvalue1, fvalue2, fvalue3;
     INT16U value0, value1, value2, value3;
     int valid_for_mysql_push;
 
@@ -334,24 +365,21 @@ int main() {
     		if (read(receive_server_fd, &pipe_msg, sizeof(pipe_message)) != sizeof(pipe_message)) {
         	    printf("MAIN: Error in reading server pipe, function read().\n");
     		} else {
-    			if (pipe_msg.send_code != 0) {
-    			} else if (pipe_msg.send_code == 0) {
-    			}
     			time(&curr_time);
     			localtime_r(&curr_time, &ltime);
-    			value0 = (INT16U)pipe_msg.message[1]+(INT16U)pipe_msg.message[2]*256;
-    			value1 = (INT16U)pipe_msg.message[3]+(INT16U)pipe_msg.message[4]*256;
-    			value2 = (INT16U)pipe_msg.message[5]+(INT16U)pipe_msg.message[6]*256;
-    			value3 = (INT16U)pipe_msg.message[7]+(INT16U)pipe_msg.message[8]*256;
+    			value0 = (INT16U)pipe_msg.msg_payload[1]+(INT16U)pipe_msg.msg_payload[2]*256;
+    			value1 = (INT16U)pipe_msg.msg_payload[3]+(INT16U)pipe_msg.msg_payload[4]*256;
+    			value2 = (INT16U)pipe_msg.msg_payload[5]+(INT16U)pipe_msg.msg_payload[6]*256;
+    			value3 = (INT16U)pipe_msg.msg_payload[7]+(INT16U)pipe_msg.msg_payload[8]*256;
 
     			printf("MAIN: Client Request Received (Size %u, Time %02u.%02u.%02u %02u:%02u:%02u): %c %05u %05u %05u %05u %c.\n",
-    				   pipe_msg.size, ltime.tm_mday, ltime.tm_mon + 1, ltime.tm_year + 1900,
-    								  ltime.tm_hour, ltime.tm_min, ltime.tm_sec, pipe_msg.message[0],
+    				   pipe_msg.msg_payload_size, ltime.tm_mday, ltime.tm_mon + 1, ltime.tm_year + 1900,
+    								  ltime.tm_hour, ltime.tm_min, ltime.tm_sec, pipe_msg.msg_payload[0],
 									  value0, value1, value2, value3,
-									  pipe_msg.message[9]);
+									  pipe_msg.msg_payload[9]);
 
     			if (prev_recv_sec != ltime.tm_sec) {
-        			valid_for_mysql_push = ((value0 > 0) && (pipe_msg.message[0] == '!') && (pipe_msg.message[9] == '#'));
+        			valid_for_mysql_push = ((value0 > 0) && (pipe_msg.msg_payload[0] == '!') && (pipe_msg.msg_payload[9] == '#'));
         			prev_recv_sec = ltime.tm_sec;
     			} else {
     				valid_for_mysql_push = 0;
@@ -374,12 +402,14 @@ int main() {
     				strcat(query_str, temp_str);
     				strcat(query_str, "');");
 
-    				printf("MAIN: MySQL %s query generated (time %02u:%02u:%02u):\n \"%s\".\n", db_table,
-    						ltime.tm_hour, ltime.tm_min, ltime.tm_sec,
-							query_str);
+    				gettimeofday(&meas_tv, NULL);
     				if (mysql_query(conn, query_str)) {
     					finish_with_error(conn);
     				}
+    				elapsed_time = elapsed_usec(meas_tv);
+    				printf("MAIN: MySQL %s query generated (time %02u:%02u:%02u, consuming %lu us):\n \"%s\".\n", db_table,
+    						ltime.tm_hour, ltime.tm_min, ltime.tm_sec, elapsed_time,
+							query_str);
     			} else {
     				if (value0 > 0) {
     					fvalue1 = (float)value1/(float)value0;
@@ -412,13 +442,15 @@ int main() {
 				strcat(query_str, temp_str);
 				strcat(query_str, "');");
 
-				printf("MAIN: TEST MySQL %s query generated (time %02u:%02u:%02u):\n \"%s\".\n", db_table,
-						ltime.tm_hour, ltime.tm_min, ltime.tm_sec,
-						query_str);
+				gettimeofday(&meas_tv, NULL);
 				if (mysql_query(conn, query_str)) {
 					finish_with_error(conn);
 				}
+				elapsed_time = elapsed_usec(meas_tv);
 
+				printf("MAIN: TEST MySQL %s query generated (time %02u:%02u:%02u, consuming %lu us):\n \"%s\".\n", db_table,
+						ltime.tm_hour, ltime.tm_min, ltime.tm_sec, elapsed_time,
+						query_str);
 
 			} else if (keyb_input[0] == 'i') {
 				/* send SQL query table names // get_template_part( 'template-parts/footer/site', 'info' ); */
